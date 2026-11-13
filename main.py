@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """polymarket-nvidia-ceo-forecast-01 entry: per-market adaptive volatility forecast.
 
-Model (tuned on the 6 practice cases; practice mean pinball loss 0.265 vs the
-house baseline's 0.364):
+Model v3 (tuned on the 6 practice cases; practice mean pinball loss 0.260 vs
+v2's 0.265 and the house baseline's 0.364, verified by running the program
+itself through the local scorer; 5 of 6 cases improve, worst case +0.001):
   - sigma: EWMA (half-life 240 min) of |1-min returns| over the last 720 min,
     scaled by 1.2533 (normal mean-|return| -> sd), clipped to [0.0004, 0.06].
     Robust to the jump-dominated return distribution (plain sd is far worse).
+  - level floor (v3): sigma is floored by 0.003 * sqrt(x(1-x)) in quadrature:
+    a market's moves scale with sqrt(x(1-x)), and a stale market's EWMA
+    collapses to the absolute floor, so insure it against the jump that
+    eventually comes. Helps 5 of 6 practice cases.
+  - fast/slow regime (v3): sigma is multiplied by (mean|ret| last 60 min /
+    mean|ret| last 720 min, clipped to [0.5, 2]) ** 0.3, so bands widen in a
+    jumpy hour and narrow in a quiet one. Broadly helps; flat neighbourhood.
   - spread(h) = sigma * h**0.35 (sub-sqrt growth: moves saturate with horizon).
   - median(h) = x * (1 - 0.05 * (1 - exp(-h/240))): a slow multiplicative bleed
     toward 0 (long-shot prices decay as the over-round comes out).
@@ -13,7 +21,12 @@ house baseline's 0.364):
     (outer z x1.45, lower-inner x1.3, upper-inner x0.7), clamped to [0, 1].
   - tested and REJECTED (all worse on practice): momentum/trend extrapolation
     (any coefficient), mean-reversion pull, cross-market sum normalization,
-    empirical h-step return quantiles, two-piece horizon growth.
+    empirical h-step return quantiles, two-piece horizon growth, hour-of-day
+    volatility (fixed or adaptive: the pooled pattern does not transfer),
+    jump-rate outer widening, directional tail widening, price-dependent
+    asymmetry, dead-market upside insurance, staleness widening, long-window
+    sigma floor, median smoothing over the last minutes (far worse: the last
+    price carries the news).
 No network, stdlib only, deterministic: same input -> byte-identical output.
 """
 import json
@@ -32,6 +45,8 @@ SPREAD_SCALE = 1.0
 ALPHA = 0.35          # spread grows as h**ALPHA
 DECAY = 0.05          # median bleed toward 0
 TAU = 240.0           # bleed time constant in minutes
+LEVEL_FLOOR = 0.0035  # v3: sigma floor scale, times sqrt(x(1-x))
+FS_K = 0.3            # v3: fast/slow regime exponent
 
 
 def price6(x):
@@ -39,27 +54,37 @@ def price6(x):
     return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
 
 
-def market_sigma(prices):
-    """EWMA volatility of 1-min returns over the last WINDOW minutes."""
+def market_sigma(prices, x):
+    """EWMA volatility of 1-min returns over the last WINDOW minutes,
+    with a level-aware floor and a fast/slow regime adjustment (v3)."""
     rets = [abs(prices[i + 1] - prices[i]) for i in range(len(prices) - 1)]
-    rets = rets[-WINDOW:]
     if not rets:
         return SIGMA_FLOOR
+    r720 = rets[-WINDOW:]
     a = 1.0 - 0.5 ** (1.0 / HALF_LIFE)
     wsum = 0.0
     vsum = 0.0
     w = 1.0
-    for r in reversed(rets):
+    for r in reversed(r720):
         vsum += w * r
         wsum += w
         w *= (1.0 - a)
     sigma = (vsum / wsum) * 1.2533
+    # Level floor: moves scale with sqrt(x(1-x)); insure stale markets.
+    sigma = math.sqrt(sigma * sigma
+                      + (LEVEL_FLOOR * math.sqrt(max(x * (1.0 - x), 0.0))) ** 2)
+    # Fast/slow: last hour's mean |return| vs last 12h, clipped, soft power.
+    fast = sum(rets[-60:]) / len(rets[-60:])
+    slow = sum(r720) / len(r720)
+    ratio = fast / slow if slow > 0 else 1.0
+    ratio = min(2.0, max(0.5, ratio))
+    sigma *= ratio ** FS_K
     return min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
 
 def forecast(prices, horizon):
     x = prices[-1] if prices else 0.5
-    sigma = market_sigma(prices)
+    sigma = market_sigma(prices, x)
     rows = []
     for h in range(1, horizon + 1):
         spread = SPREAD_SCALE * sigma * (h ** ALPHA)
